@@ -1,6 +1,8 @@
 # nsr — DNS Record Lookup CLI (macOS / Linux)
 
-`nsr` is a lightweight command-line tool that queries DNS records using the **nslookup.io** API and prints them in a clear, structured table format.
+`nsr` is a lightweight command-line tool that queries DNS records using the **DNS-over-HTTPS API** and prints them in a clear, structured table format.
+
+![Tool result example](./screen-sample.png)
 
 It requires **no external Python libraries**, works offline except for the query itself, and supports multiple resolver backends (Cloudflare, Google, Quad9, OpenDNS).
 
