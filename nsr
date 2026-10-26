@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# nsr — DNS records fetcher for nslookup.io
+# nsr — DNS queries via DNS-over-HTTPS (DoH)
 # Usage:
 #   nsr rcdeiraq.com                 # default dns server: cloudflare
 #   nsr rcdeiraq.com --dns google    # cloudflare|google|quad9|opendns
@@ -7,21 +7,45 @@
 #   nsr rcdeiraq.com --raw           # dump API JSON
 #   nsr --help
 
-import sys, json, argparse, urllib.request, urllib.error, ssl
+import argparse
+import json
+import ssl
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 
-API_URL = "https://www.nslookup.io/api/v1/records"
+API_URL = "https://dns.google/resolve"
 DNS_CHOICES = ["cloudflare", "google", "quad9", "opendns"]
+TYPE_MAP = {"A": 1, "AAAA": 28, "MX": 15, "NS": 2, "TXT": 16, "CNAME": 5, "SOA": 6}
+TYPE_NAMES = {"A": "A", "AAAA": "AAAA", "MX": "MX", "NS": "NS", "TXT": "TXT", "CNAME": "CNAME", "SOA": "SOA"}
+RESOLVER_URLS = {
+    "google": "https://dns.google/resolve",
+    "cloudflare": "https://cloudflare-dns.com/dns-query",
+    "quad9": "https://dns.quad9.net/dns-query",
+    "opendns": "https://doh.opendns.com/dns-query",
+}
+USER_AGENT = "nsr/1.0 (+https://github.com/iq5sa/nsr-cli)"
+
 
 def post_json(url, payload, timeout=15):
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    params = urllib.parse.urlencode(payload)
+    req = urllib.request.Request(
+        f"{url}?{params}",
+        headers={"Accept": "application/dns-json", "User-Agent": USER_AGENT},
+    )
     ctx = ssl.create_default_context()
     with urllib.request.urlopen(req, context=ctx, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
+
 def colfit(values, minw=4, maxw=60):
-    w = max(minw, min(max(len(str(v)) for v in values), maxw))
+    values = [str(v) for v in values]
+    if not values:
+        return minw
+    w = max(minw, min(max(len(v) for v in values), maxw))
     return w
+
 
 def print_table(rows, headers):
     if not rows:
@@ -35,6 +59,7 @@ def print_table(rows, headers):
     for r in rows:
         print(fmt.format(*[("" if x is None else x) for x in r]))
 
+
 def pick(v, *keys, default=None):
     for k in keys:
         if isinstance(v, dict) and k in v:
@@ -42,6 +67,78 @@ def pick(v, *keys, default=None):
         else:
             return default
     return v
+
+
+def normalize_answer(record_type, answer):
+    name = answer.get("name") or ""
+    ttl = answer.get("TTL")
+    raw = answer.get("data") or ""
+
+    if record_type in ("A", "AAAA"):
+        return {"record": {"name": name, "ttl": ttl, "ip": raw, "target": raw}}
+    if record_type == "MX":
+        pieces = raw.split()
+        if len(pieces) >= 2:
+            priority, target = pieces[0], pieces[1]
+        else:
+            priority, target = None, raw
+        return {"record": {"name": name, "ttl": ttl, "priority": priority, "target": target}}
+    if record_type in ("NS", "CNAME"):
+        return {"record": {"name": name, "ttl": ttl, "target": raw}}
+    if record_type == "TXT":
+        text = raw.strip()
+        strings = [text] if text else []
+        return {"record": {"name": name, "ttl": ttl, "strings": strings}}
+    if record_type == "SOA":
+        parts = raw.split()
+        if len(parts) >= 7:
+            host, admin, serial, refresh, retry, expire, minimum = parts[:7]
+        else:
+            host, admin, serial, refresh, retry, expire, minimum = (None, None, None, None, None, None, None)
+        return {
+            "record": {
+                "name": name,
+                "ttl": ttl,
+                "host": host,
+                "admin": admin,
+                "serial": serial,
+                "refresh": refresh,
+                "retry": retry,
+                "expire": expire,
+                "minimum": minimum,
+            }
+        }
+    return {"record": {"name": name, "ttl": ttl, "target": raw}}
+
+
+def fetch_section(domain, dns_name, record_type, timeout=15):
+    endpoint = RESOLVER_URLS.get(dns_name, API_URL)
+    params = {"name": domain, "type": TYPE_NAMES.get(record_type, record_type)}
+    try:
+        data = post_json(endpoint, params, timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="ignore")
+        return {
+            "query": {"server": {"ip": dns_name}},
+            "response": {"rCode": f"HTTP_{exc.code}", "answer": []},
+            "error": body,
+        }
+    except Exception as exc:
+        return {
+            "query": {"server": {"ip": dns_name}},
+            "response": {"rCode": f"ERROR", "answer": []},
+            "error": str(exc),
+        }
+
+    answers = []
+    for item in data.get("Answer", []):
+        if item.get("type") != TYPE_MAP.get(record_type):
+            continue
+        answers.append(normalize_answer(record_type, item))
+
+    rcode = "NOERROR" if data.get("Status") == 0 else f"RCODE_{data.get('Status')}"
+    return {"query": {"server": {"ip": dns_name}}, "response": {"rCode": rcode, "answer": answers}}
+
 
 def extract_rows(record_type, section):
     """Return list of ordered rows (lists/tuples) per record type."""
@@ -68,9 +165,10 @@ def extract_rows(record_type, section):
             rows.append([name, ttl, target])
         elif record_type == "SOA":
             rows.append([
-                name, ttl,
-                rec.get("host"),     # MNAME
-                rec.get("admin"),    # RNAME
+                name,
+                ttl,
+                rec.get("host"),
+                rec.get("admin"),
                 rec.get("serial"),
                 rec.get("refresh"),
                 rec.get("retry"),
@@ -78,6 +176,7 @@ def extract_rows(record_type, section):
                 rec.get("minimum"),
             ])
     return rows
+
 
 def print_section(rt, section):
     q = pick(section, "query", default={})
@@ -105,8 +204,9 @@ def print_section(rt, section):
     elif rt == "SOA":
         print_table(rows, ["Name", "TTL", "MNAME", "RNAME", "Serial", "Refresh", "Retry", "Expire", "MinTTL"])
 
+
 def main():
-    ap = argparse.ArgumentParser(description="Fetch DNS records from nslookup.io and pretty-print them.")
+    ap = argparse.ArgumentParser(description="Fetch DNS records using DNS-over-HTTPS and pretty-print them.")
     ap.add_argument("domain", nargs="?", help="Domain name (e.g., example.com)")
     ap.add_argument("--dns", default="cloudflare", choices=DNS_CHOICES, help="Resolver to query")
     ap.add_argument("--types", default="A,AAAA,MX,NS,TXT,SOA", help="Comma-separated list (e.g. A,MX,TXT)")
@@ -115,31 +215,38 @@ def main():
     args = ap.parse_args()
 
     if not args.domain:
-        ap.print_help(sys.stderr); sys.exit(2)
+        ap.print_help(sys.stderr)
+        sys.exit(2)
 
     dom = args.domain.strip().rstrip(".")
-    req = {"domain": dom, "dnsServer": args.dns}
+    want = [t.strip().upper() for t in args.types.split(",") if t.strip()]
+    records = {}
+
     try:
-        data = post_json(API_URL, req, timeout=args.timeout)
-    except urllib.error.HTTPError as e:
-        sys.stderr.write(f"HTTP error {e.code}: {e.read().decode('utf-8', errors='ignore')}\n"); sys.exit(1)
-    except Exception as e:
-        sys.stderr.write(f"Request failed: {e}\n"); sys.exit(1)
+        for rt in want:
+            if rt not in TYPE_MAP:
+                print(f"[{rt}] (unsupported record type)")
+                continue
+            records[rt.lower()] = fetch_section(dom, args.dns, rt, timeout=args.timeout)
+    except Exception as exc:
+        sys.stderr.write(f"Request failed: {exc}\n")
+        sys.exit(1)
 
     if args.raw:
-        print(json.dumps(data, ensure_ascii=False, indent=2)); return
+        print(json.dumps({"domain": dom, "dnsServer": args.dns, "records": records}, ensure_ascii=False, indent=2))
+        return
 
-    print(f"Domain: {data.get('unicodeDomain') or dom}\nDNS Server: {args.dns}\n")
-
-    want = [t.strip().upper() for t in args.types.split(",") if t.strip()]
-    keymap = {"A":"a","AAAA":"aaaa","MX":"mx","NS":"ns","TXT":"txt","CNAME":"cname","SOA":"soa"}
-
-    records = data.get("records", {})
+    print(f"Domain: {dom}\nDNS Server: {args.dns}\n")
     for rt in want:
-        section = records.get(keymap.get(rt))
+        if rt not in TYPE_MAP:
+            continue
+        section = records.get(rt.lower())
         if not section:
-            print(f"[{rt}] (no section returned)\n"); continue
-        print_section(rt, section); print()
+            print(f"[{rt}] (no section returned)\n")
+            continue
+        print_section(rt, section)
+        print()
+
 
 if __name__ == "__main__":
     main()
